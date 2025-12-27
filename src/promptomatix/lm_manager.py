@@ -61,6 +61,13 @@ class LMManager:
         # Add provider-specific configurations
         if provider == 'openai' and api_base:
             lm_args["api_base"] = api_base
+        if provider == 'openai' and api_base:
+             lm_args["api_base"] = api_base
+        # Pass through Azure-specific settings if provided
+        if "api_type" in kwargs:
+            lm_args["api_type"] = kwargs["api_type"]
+        if "api_version" in kwargs:
+            lm_args["api_version"] = kwargs["api_version"]
             
         # Initialize the LM
         try:

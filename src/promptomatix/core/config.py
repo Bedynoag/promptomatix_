@@ -1,4 +1,5 @@
 import os
+import sys
 import ast
 import json
 import logging
@@ -117,6 +118,10 @@ def setup_config_logger():
     Creates a file handler that logs all LLM prompts and responses to a dedicated file
     in the logs directory.
     """
+    # Check if handler already exists to avoid duplicates
+    if hasattr(setup_config_logger, '_handler_added'):
+        return
+    
     logger.setLevel(logging.DEBUG)
 
     # Ensure the config logs directory exists
@@ -126,9 +131,28 @@ def setup_config_logger():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = CONFIG_LOGS_DIR / f"llm_interactions_{timestamp}.jsonl"
 
-    # File Handler for JSON Lines format
+    # File Handler for JSON Lines format - completely fail-safe
     class JSONLinesHandler(logging.FileHandler):
+        def __init__(self, filename, mode='a', encoding=None, delay=False):
+            super().__init__(filename, mode, encoding, delay)
+            import threading
+            self._lock = threading.Lock() if 'threading' in sys.modules else None
+        
         def emit(self, record):
+            # Completely wrap in try-except to prevent any errors from propagating
+            try:
+                # Use lock if available for thread safety
+                if self._lock:
+                    with self._lock:
+                        self._emit_record(record)
+                else:
+                    self._emit_record(record)
+            except:
+                # Silently ignore ALL errors - don't let logging break the application
+                pass
+        
+        def _emit_record(self, record):
+            # Wrap everything in try-except to be completely fail-safe
             try:
                 # Only try to parse JSON if it's an LLM interaction
                 if hasattr(record, 'llm_interaction'):
@@ -141,13 +165,24 @@ def setup_config_logger():
                         'message': self.format(record)
                     }
                 
-                with open(self.baseFilename, 'a') as f:
-                    json.dump(msg, f)
-                    f.write('\n')
-            except Exception as e:
-                # Log error to stderr but don't raise to avoid logging loops
-                import sys
-                print(f"Error in JSONLinesHandler: {str(e)}", file=sys.stderr)
+                # Check if stream is available and open
+                try:
+                    if self.stream is None or (hasattr(self.stream, 'closed') and self.stream.closed):
+                        self.stream = self._open()
+                except:
+                    return  # If we can't open, skip silently
+                
+                # Write to the file - catch ALL possible errors
+                try:
+                    json.dump(msg, self.stream)
+                    self.stream.write('\n')
+                    self.flush()
+                except:
+                    # If ANY error occurs (I/O, JSON, etc.), skip silently
+                    return
+            except:
+                # Catch-all: silently ignore everything
+                return
 
     # Custom formatter for LLM interactions
     class LLMInteractionFormatter(logging.Formatter):
@@ -157,11 +192,15 @@ def setup_config_logger():
             return super().format(record)
 
     # Set up file handler with custom formatter
-    file_handler = JSONLinesHandler(log_file)
-    file_handler.setFormatter(LLMInteractionFormatter())
-    logger.addHandler(file_handler)
-
-    logger.info(f"Config LLM interaction logger initialized. Log file: {log_file}")
+    try:
+        file_handler = JSONLinesHandler(log_file)
+        file_handler.setFormatter(LLMInteractionFormatter())
+        logger.addHandler(file_handler)
+        setup_config_logger._handler_added = True
+        logger.info(f"Config LLM interaction logger initialized. Log file: {log_file}")
+    except:
+        # If handler setup fails, continue without logging
+        pass
 
 def log_llm_interaction(prompt: str, response: str, context: str = None):
     """Log an LLM interaction with structured data.
@@ -731,6 +770,18 @@ class Config:
         for key, value in search_configs[self.search_type].items():
             if getattr(self, key, None) is None:
                 setattr(self, key, value)
+        
+        # Warn if dataset size is too small for DSPy backend (but don't auto-adjust)
+        # MIPROv2 needs sufficient data to optimize effectively
+        if self.backend == 'dspy' and hasattr(self, 'synthetic_data_size') and self.synthetic_data_size is not None:
+            min_size_for_dspy = 20  # Minimum recommended for MIPROv2
+            if self.synthetic_data_size < min_size_for_dspy:
+                logger.warning(
+                    f"synthetic_data_size ({self.synthetic_data_size}) is very small for DSPy backend. "
+                    f"MIPROv2 typically needs at least {min_size_for_dspy} samples for effective optimization. "
+                    f"Optimization may be limited with only {self.synthetic_data_size} samples."
+                )
+                # Don't auto-adjust - respect user's explicit choice
 
     def _validate(self) -> None:
         """Validate all configuration parameters after population.
@@ -886,6 +937,68 @@ class Config:
             ValueError: If model provider is invalid
             EnvironmentError: If required API key is missing
         """
+        # Check for Azure OpenAI credentials first
+        azure_key = os.getenv("AZURE_OPENAI_KEY")
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+        use_azure = azure_key and azure_endpoint and deployment_name
+        
+        if use_azure:
+            # Set up Azure environment variables for DSPy
+            os.environ["AZURE_API_KEY"] = azure_key
+            azure_endpoint_clean = azure_endpoint.rstrip('/')
+            os.environ["AZURE_API_BASE"] = azure_endpoint_clean
+            os.environ["AZURE_API_VERSION"] = azure_api_version
+            
+            # Set OPENAI_API_KEY to Azure key so Config can use it
+            if "OPENAI_API_KEY" not in os.environ:
+                os.environ["OPENAI_API_KEY"] = azure_key
+            
+            # Use Azure deployment name as model name (for both main and config models)
+            azure_model_name = f"azure/{deployment_name}"
+            if not self.config_model_name or not self.config_model_name.startswith("azure/"):
+                self.config_model_name = azure_model_name
+            if not self.model_name or not self.model_name.startswith("azure/"):
+                self.model_name = azure_model_name
+            
+            # Set API base for Azure
+            if not self.config_model_api_base:
+                self.config_model_api_base = azure_endpoint_clean
+            if not self.model_api_base:
+                self.model_api_base = azure_endpoint_clean
+            
+            # Set API key for Azure
+            if not self.config_model_api_key:
+                self.config_model_api_key = azure_key
+            if not self.model_api_key:
+                self.model_api_key = azure_key
+            
+            # Set provider to OpenAI (Azure OpenAI is compatible with OpenAI API)
+            if not self.config_model_provider:
+                self.config_model_provider = ModelProvider.OPENAI
+            if not self.model_provider:
+                self.model_provider = ModelProvider.OPENAI
+            
+            # Initialize Azure OpenAI model
+            try:
+                tmp_lm = dspy.LM(
+                    self.config_model_name,
+                    max_tokens=self.config_max_tokens,
+                    temperature=self.config_temperature,
+                    cache=True
+                )
+                logger.info(f"Successfully initialized Azure OpenAI model: {self.config_model_name}")
+                log_llm_interaction(
+                    context="Model initialization",
+                    prompt="N/A",
+                    response=f"Initialized Azure OpenAI model: {self.config_model_name}"
+                )
+                return tmp_lm
+            except Exception as e:
+                logger.error(f"Failed to initialize Azure OpenAI model: {str(e)}")
+                raise RuntimeError(f"Failed to initialize Azure OpenAI model: {str(e)}")
+        
         PROVIDER_CONFIGS = {
             ModelProvider.OPENAI: {
                 'api_base': 'https://api.openai.com/v1',
@@ -1661,6 +1774,9 @@ class Config:
     def _calculate_dataset_sizes(self) -> None:
         """Calculate sizes for training and validation datasets."""
         self.train_data_size = int(self.synthetic_data_size * self.train_ratio)
+        # Ensure at least 1 sample in training set if we have any synthetic data
+        if self.synthetic_data_size > 0 and self.train_data_size == 0:
+            self.train_data_size = 1
         self.valid_data_size = self.synthetic_data_size - self.train_data_size
         
         logger.debug(f"Calculated dataset sizes - Train: {self.train_data_size}, Valid: {self.valid_data_size}")

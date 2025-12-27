@@ -9,11 +9,17 @@ import subprocess
 import sys
 from setuptools import setup, find_packages
 
+# Set UTF-8 encoding for Windows compatibility
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 def download_nltk_data():
     """Download required NLTK data during installation."""
     try:
         import nltk
-        print("📥 Downloading NLTK data...")
+        print("Downloading NLTK data...")
         
         # Download required NLTK data
         required_data = [
@@ -25,18 +31,18 @@ def download_nltk_data():
         for data_path in required_data:
             try:
                 nltk.data.find(data_path)
-                print(f"  ✓ {data_path} already available")
+                print(f"  [OK] {data_path} already available")
             except LookupError:
-                print(f"  📥 Downloading {data_path}...")
+                print(f"  Downloading {data_path}...")
                 nltk.download(data_path.split('/')[0], quiet=True)
-                print(f"  ✓ Downloaded {data_path}")
+                print(f"  [OK] Downloaded {data_path}")
         
-        print("✅ NLTK data download complete!")
+        print("NLTK data download complete!")
         
     except ImportError:
-        print("⚠️  NLTK not available during setup, will download at runtime")
+        print("[WARNING] NLTK not available during setup, will download at runtime")
     except Exception as e:
-        print(f"⚠️  Error downloading NLTK data: {e}")
+        print(f"[WARNING] Error downloading NLTK data: {e}")
 
 def main():
     # Download NLTK data during installation
@@ -92,11 +98,14 @@ def main():
         },
     )
     
-    print("\n🎉 Promptomatix installed successfully!")
+    print("\n[SUCCESS] Promptomatix installed successfully!")
     print("\nQuick start:")
     print("  1. cp .env.example .env")
     print("  2. Edit .env with your API keys")
-    print("  3. source promptomatix_env/bin/activate")
+    if sys.platform == 'win32':
+        print("  3. promptomatix_env\\Scripts\\activate")
+    else:
+        print("  3. source promptomatix_env/bin/activate")
     print("  4. promtomatic --raw_input 'Classify sentiment'")
 
 if __name__ == "__main__":

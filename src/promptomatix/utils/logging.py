@@ -10,6 +10,15 @@ import json
 from pathlib import Path
 from .paths import SESSION_LOGS_DIR
 
+class SafeFileHandler(logging.FileHandler):
+    """FileHandler that never raises (prevents 'I/O operation on closed file' from crashing runs)."""
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except (OSError, IOError, ValueError):
+            # ValueError can be raised when the underlying stream is closed.
+            return
+
 class SessionLogger:
     """
     Handles logging for individual optimization sessions.
@@ -42,7 +51,7 @@ class SessionLogger:
         self.app_logger.setLevel(logging.INFO)
         
         # Add handlers for app logger
-        app_handler = logging.FileHandler(app_log_file)
+        app_handler = SafeFileHandler(app_log_file, encoding="utf-8", delay=True)
         app_handler.setFormatter(logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         ))
@@ -51,13 +60,18 @@ class SessionLogger:
         # Configure DSPy logger
         self.dspy_logger = logging.getLogger('dspy')
         self.dspy_logger.setLevel(logging.DEBUG)
+        # Prevent double-logging to root handlers (which may include fragile file handlers).
+        self.dspy_logger.propagate = False
         
         # Add handler for DSPy logger
-        dspy_handler = logging.FileHandler(dspy_log_file)
-        dspy_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        ))
-        self.dspy_logger.addHandler(dspy_handler)
+        # Guard against adding multiple handlers across sessions in the same process.
+        if not getattr(self.dspy_logger, "_promptomatix_safe_filehandler_added", False):
+            dspy_handler = SafeFileHandler(dspy_log_file, encoding="utf-8", delay=True)
+            dspy_handler.setFormatter(logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            ))
+            self.dspy_logger.addHandler(dspy_handler)
+            self.dspy_logger._promptomatix_safe_filehandler_added = True
     
     def add_entry(self, entry_type: str, data: Dict[str, Any]) -> None:
         """

@@ -22,6 +22,22 @@ from tqdm import tqdm
 import threading
 import queue
 
+# Set UTF-8 encoding for Windows compatibility (handles emoji characters)
+if sys.platform == 'win32':
+    # Prefer `reconfigure()` when available to avoid swapping out the stream object,
+    # which can interact poorly with libraries like tqdm/colorama and lead to
+    # "I/O operation on closed file" / lost stderr issues.
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from .core.config import Config
 from .core.optimizer import PromptOptimizer
 from .core.session import SessionManager, OptimizationSession
@@ -68,6 +84,43 @@ def process_input(**kwargs) -> Dict:
         print("🚀 Starting Promptomatix optimization...")
         start_time = time.time()
         
+        # Check for Azure OpenAI credentials and set up environment
+        azure_key = os.getenv("AZURE_OPENAI_KEY")
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+        
+        use_azure = azure_key and azure_endpoint and deployment_name
+        
+        if use_azure:
+            # Set up Azure environment variables for DSPy
+            os.environ["AZURE_API_KEY"] = azure_key
+            # Azure endpoints should not have /v1 suffix
+            azure_endpoint_clean = azure_endpoint.rstrip('/')
+            os.environ["AZURE_API_BASE"] = azure_endpoint_clean
+            os.environ["AZURE_API_VERSION"] = azure_api_version
+            
+            # Set OPENAI_API_KEY to Azure key so Config can use it
+            # This allows Config to work with Azure OpenAI
+            if "OPENAI_API_KEY" not in os.environ:
+                os.environ["OPENAI_API_KEY"] = azure_key
+            
+            # Set model name to Azure deployment name if not provided
+            if "model_name" not in kwargs or not kwargs.get("model_name"):
+                kwargs["model_name"] = f"azure/{deployment_name}"
+            elif not kwargs["model_name"].startswith("azure/"):
+                # If model name is provided but not in Azure format, use deployment name
+                kwargs["model_name"] = f"azure/{deployment_name}"
+            
+            # Set API base for Azure if not already set
+            # Azure OpenAI uses a different endpoint format than standard OpenAI
+            if "model_api_base" not in kwargs and azure_endpoint_clean:
+                # Azure endpoints are in format: https://resource.openai.azure.com
+                # Don't add /v1 for Azure endpoints
+                kwargs["model_api_base"] = azure_endpoint_clean
+                # Also set for config model
+                kwargs["config_model_api_base"] = azure_endpoint_clean
+        
         # Create config
         config = Config(**kwargs)
         config.session_id = session_id
@@ -80,13 +133,22 @@ def process_input(**kwargs) -> Dict:
         )
         
         # Initialize language model with configurable parameters
-        lm = dspy.LM(
-            config.model_name,
-            api_key=config.model_api_key,
-            api_base=config.model_api_base,
-            temperature=config.temperature,
-            max_tokens=config.max_tokens
-        )
+        if use_azure:
+            # Use Azure OpenAI deployment
+            lm = dspy.LM(
+                f"azure/{deployment_name}",
+                temperature=config.temperature,
+                max_tokens=config.max_tokens
+            )
+        else:
+            # Use standard OpenAI or other provider
+            lm = dspy.LM(
+                config.config_model_name,
+                api_key=config.config_model_api_key,
+                api_base=config.config_model_api_base,
+                temperature=config.temperature,
+                max_tokens=config.max_tokens
+            )
         dspy.configure(lm=lm)
                 
         # Create and run optimizer
@@ -194,14 +256,30 @@ def optimize_with_feedback(session_id: str) -> Dict:
         dspy.settings.configure(reset=True)
         
         # Initialize language model
-        lm = dspy.LM(
-            feedback_config.model_name,
-            api_key=feedback_config.model_api_key,
-            api_base=feedback_config.model_api_base,
-            temperature=feedback_config.temperature,
-            max_tokens=feedback_config.max_tokens,
-            cache=True
-        )
+        # Check if using Azure OpenAI
+        azure_key = os.getenv("AZURE_OPENAI_KEY")
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+        use_azure = azure_key and azure_endpoint and deployment_name
+        
+        if use_azure and feedback_config.model_name and feedback_config.model_name.startswith("azure/"):
+            # Use Azure OpenAI - DSPy will read from environment variables
+            lm = dspy.LM(
+                feedback_config.model_name,
+                temperature=feedback_config.temperature,
+                max_tokens=feedback_config.max_tokens,
+                cache=True
+            )
+        else:
+            # Use standard provider
+            lm = dspy.LM(
+                feedback_config.model_name,
+                api_key=feedback_config.model_api_key,
+                api_base=feedback_config.model_api_base,
+                temperature=feedback_config.temperature,
+                max_tokens=feedback_config.max_tokens,
+                cache=True
+            )
         
         # Configure DSPy with the new LM instance
         dspy.configure(lm=lm)
@@ -301,15 +379,31 @@ def optimize_with_synthetic_feedback(session_id: str, synthetic_feedback: str) -
         
         # Create a new DSPy settings context for this thread
         with dspy.settings.context():
+            # Check if using Azure OpenAI
+            azure_key = os.getenv("AZURE_OPENAI_KEY")
+            azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+            deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+            use_azure = azure_key and azure_endpoint and deployment_name
+            
             # Initialize language model
-            lm = dspy.LM(
-                feedback_config.model_name,
-                api_key=feedback_config.model_api_key,
-                api_base=feedback_config.model_api_base,
-                temperature=feedback_config.temperature,
-                max_tokens=feedback_config.max_tokens,
-                cache=True
-            )
+            if use_azure and feedback_config.model_name and feedback_config.model_name.startswith("azure/"):
+                # Use Azure OpenAI - DSPy will read from environment variables
+                lm = dspy.LM(
+                    feedback_config.model_name,
+                    temperature=feedback_config.temperature,
+                    max_tokens=feedback_config.max_tokens,
+                    cache=True
+                )
+            else:
+                # Use standard provider
+                lm = dspy.LM(
+                    feedback_config.model_name,
+                    api_key=feedback_config.model_api_key,
+                    api_base=feedback_config.model_api_base,
+                    temperature=feedback_config.temperature,
+                    max_tokens=feedback_config.max_tokens,
+                    cache=True
+                )
             
             # Configure DSPy with the new LM instance
             dspy.configure(lm=lm)
@@ -819,115 +913,230 @@ def display_fancy_result(result: Dict) -> None:
     Args:
         result (Dict): The result dictionary from process_input
     """
-    # Try to import colorama, fallback to plain text if not available
+    # Wrap everything in try-except to handle I/O errors gracefully
     try:
-        import colorama
-        from colorama import Fore, Back, Style
-        colorama.init()
-        USE_COLORS = True
-    except ImportError:
-        # Fallback colors for systems without colorama
-        class DummyColors:
-            def __getattr__(self, name):
-                return ""
-        Fore = Back = Style = DummyColors()
-        USE_COLORS = False
-    
-    from datetime import datetime
-    
-    # Check for errors first
-    if 'error' in result:
-        print(f"\n{Fore.RED}❌ Optimization Failed{Style.RESET_ALL}")
-        print(f"{Fore.RED}Error: {result['error']}{Style.RESET_ALL}")
-        if 'traceback' in result:
-            print(f"{Fore.YELLOW}Traceback: {result['traceback']}{Style.RESET_ALL}")
-        return
-    
-    # Header
-    print(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}{' PROMPTOMATIX OPTIMIZATION RESULTS':^80}{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
-    
-    # Session Info
-    print(f"\n{Fore.BLUE}📋 Session Information{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}Session ID: {Fore.YELLOW}{result.get('session_id', 'N/A')}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}Backend: {Fore.YELLOW}{result.get('backend', 'N/A')}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}Task Type: {Fore.YELLOW}{result.get('task_type', 'N/A')}{Style.RESET_ALL}")
-    
-    # Task Configuration
-    print(f"\n{Fore.BLUE}⚙️  Task Configuration{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}Input Fields: {Fore.YELLOW}{result.get('input_fields', 'N/A')}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}Output Fields: {Fore.YELLOW}{result.get('output_fields', 'N/A')}{Style.RESET_ALL}")
-    
-    # Metrics
-    metrics = result.get('metrics', {})
-    if metrics:
-        print(f"\n{Fore.BLUE}📊 Performance Metrics{Style.RESET_ALL}")
+        # Try to import colorama, fallback to plain text if not available
+        try:
+            import colorama
+            from colorama import Fore, Back, Style
+            colorama.init()
+            USE_COLORS = True
+        except (ImportError, IOError, OSError):
+            # Fallback colors for systems without colorama or I/O errors
+            class DummyColors:
+                def __getattr__(self, name):
+                    return ""
+            Fore = Back = Style = DummyColors()
+            USE_COLORS = False
         
-        # Scores
-        if 'initial_prompt_score' in metrics and 'optimized_prompt_score' in metrics:
-            initial_score = metrics['initial_prompt_score']
-            optimized_score = metrics['optimized_prompt_score']
-            improvement = optimized_score - initial_score
-            
-            print(f"{Fore.WHITE}Initial Score: {Fore.RED}{initial_score:.4f}{Style.RESET_ALL}")
-            print(f"{Fore.WHITE}Optimized Score: {Fore.GREEN}{optimized_score:.4f}{Style.RESET_ALL}")
-            
-            if improvement > 0:
-                print(f"{Fore.WHITE}Improvement: {Fore.GREEN}+{improvement:.4f} ({improvement/initial_score*100:.1f}%){Style.RESET_ALL}")
-            else:
-                print(f"{Fore.WHITE}Change: {Fore.RED}{improvement:.4f} ({improvement/initial_score*100:.1f}%){Style.RESET_ALL}")
+        from datetime import datetime
         
-        # Cost and Time
-        if 'cost' in metrics:
-            print(f"{Fore.WHITE}Total Cost: {Fore.YELLOW}${metrics['cost']:.6f}{Style.RESET_ALL}")
-        if 'time_taken' in metrics:
-            print(f"{Fore.WHITE}Processing Time: {Fore.YELLOW}{metrics['time_taken']:.3f}s{Style.RESET_ALL}")
-    
-    # Prompts
-    print(f"\n{Fore.BLUE} Prompt Comparison{Style.RESET_ALL}")
-    
-    # Original Prompt
-    if 'initial_prompt' in result:
-        print(f"\n{Fore.WHITE}Original Prompt:{Style.RESET_ALL}")
-        print(f"{Fore.RED}{'─'*40}{Style.RESET_ALL}")
-        print(f"{result['initial_prompt']}")
-        print(f"{Fore.RED}{'─'*40}{Style.RESET_ALL}")
-    
-    # Optimized Prompt
-    if 'result' in result:
-        print(f"\n{Fore.WHITE}Optimized Prompt:{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}{'─'*40}{Style.RESET_ALL}")
-        print(f"{result['result']}")
-        print(f"{Fore.GREEN}{'─'*40}{Style.RESET_ALL}")
-    
-    # Synthetic Data Summary
-    synthetic_data = result.get('synthetic_data', [])
-    if synthetic_data:
-        print(f"\n{Fore.BLUE}📚 Synthetic Data Generated{Style.RESET_ALL}")
-        print(f"{Fore.WHITE}Total Samples: {Fore.YELLOW}{len(synthetic_data)}{Style.RESET_ALL}")
+        # Check for errors first
+        if 'error' in result:
+            try:
+                print(f"\n{Fore.RED}❌ Optimization Failed{Style.RESET_ALL}")
+                print(f"{Fore.RED}Error: {result['error']}{Style.RESET_ALL}")
+                if 'traceback' in result:
+                    print(f"{Fore.YELLOW}Traceback: {result['traceback']}{Style.RESET_ALL}")
+            except (IOError, OSError):
+                # If printing fails, try without colors
+                print(f"\n❌ Optimization Failed")
+                print(f"Error: {result['error']}")
+            return
         
-        # Show a few examples
-        if len(synthetic_data) > 0:
-            print(f"\n{Fore.WHITE}Sample Data:{Style.RESET_ALL}")
-            for i, sample in enumerate(synthetic_data[:3]):  # Show first 3 samples
-                print(f"{Fore.YELLOW}Sample {i+1}:{Style.RESET_ALL}")
-                for key, value in sample.items():
-                    print(f"  {Fore.WHITE}{key}:{Style.RESET_ALL} {str(value)[:100]}{'...' if len(str(value)) > 100 else ''}")
-            if len(synthetic_data) > 3:
-                print(f"{Fore.YELLOW}... and {len(synthetic_data) - 3} more samples{Style.RESET_ALL}")
+        # Header
+        try:
+            print(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}{' PROMPTOMATIX OPTIMIZATION RESULTS':^80}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
+        except (IOError, OSError):
+            print("\n" + "="*80)
+            print(" PROMPTOMATIX OPTIMIZATION RESULTS".center(80))
+            print("="*80)
+        
+        # Session Info
+        try:
+            print(f"\n{Fore.BLUE}📋 Session Information{Style.RESET_ALL}")
+            print(f"{Fore.WHITE}Session ID: {Fore.YELLOW}{result.get('session_id', 'N/A')}{Style.RESET_ALL}")
+            print(f"{Fore.WHITE}Backend: {Fore.YELLOW}{result.get('backend', 'N/A')}{Style.RESET_ALL}")
+            print(f"{Fore.WHITE}Task Type: {Fore.YELLOW}{result.get('task_type', 'N/A')}{Style.RESET_ALL}")
+        except (IOError, OSError):
+            print("\n📋 Session Information")
+            print(f"Session ID: {result.get('session_id', 'N/A')}")
+            print(f"Backend: {result.get('backend', 'N/A')}")
+            print(f"Task Type: {result.get('task_type', 'N/A')}")
+        
+        # Task Configuration
+        try:
+            print(f"\n{Fore.BLUE}⚙️  Task Configuration{Style.RESET_ALL}")
+            print(f"{Fore.WHITE}Input Fields: {Fore.YELLOW}{result.get('input_fields', 'N/A')}{Style.RESET_ALL}")
+            print(f"{Fore.WHITE}Output Fields: {Fore.YELLOW}{result.get('output_fields', 'N/A')}{Style.RESET_ALL}")
+        except (IOError, OSError):
+            print("\n⚙️  Task Configuration")
+            print(f"Input Fields: {result.get('input_fields', 'N/A')}")
+            print(f"Output Fields: {result.get('output_fields', 'N/A')}")
+        
+        # Metrics
+        metrics = result.get('metrics', {})
+        if metrics:
+            try:
+                print(f"\n{Fore.BLUE}📊 Performance Metrics{Style.RESET_ALL}")
+                
+                # Scores
+                if 'initial_prompt_score' in metrics and 'optimized_prompt_score' in metrics:
+                    initial_score = metrics['initial_prompt_score']
+                    optimized_score = metrics['optimized_prompt_score']
+                    improvement = optimized_score - initial_score
+                    
+                    try:
+                        print(f"{Fore.WHITE}Initial Score: {Fore.RED}{initial_score:.4f}{Style.RESET_ALL}")
+                        print(f"{Fore.WHITE}Optimized Score: {Fore.GREEN}{optimized_score:.4f}{Style.RESET_ALL}")
+                        
+                        if initial_score != 0 and improvement != 0:
+                            if improvement > 0:
+                                print(f"{Fore.WHITE}Improvement: {Fore.GREEN}+{improvement:.4f} ({improvement/initial_score*100:.1f}%){Style.RESET_ALL}")
+                            else:
+                                print(f"{Fore.WHITE}Change: {Fore.RED}{improvement:.4f} ({improvement/initial_score*100:.1f}%){Style.RESET_ALL}")
+                    except (IOError, OSError, ZeroDivisionError):
+                        print(f"Initial Score: {initial_score:.4f}")
+                        print(f"Optimized Score: {optimized_score:.4f}")
+                
+                # Cost and Time
+                try:
+                    if 'cost' in metrics:
+                        print(f"{Fore.WHITE}Total Cost: {Fore.YELLOW}${metrics['cost']:.6f}{Style.RESET_ALL}")
+                    if 'time_taken' in metrics:
+                        print(f"{Fore.WHITE}Processing Time: {Fore.YELLOW}{metrics['time_taken']:.3f}s{Style.RESET_ALL}")
+                except (IOError, OSError):
+                    if 'cost' in metrics:
+                        print(f"Total Cost: ${metrics['cost']:.6f}")
+                    if 'time_taken' in metrics:
+                        print(f"Processing Time: {metrics['time_taken']:.3f}s")
+            except (IOError, OSError):
+                print("\n📊 Performance Metrics")
+                if 'initial_prompt_score' in metrics and 'optimized_prompt_score' in metrics:
+                    print(f"Initial Score: {metrics['initial_prompt_score']:.4f}")
+                    print(f"Optimized Score: {metrics['optimized_prompt_score']:.4f}")
+
+        # Optimization debug (helps explain why prompts may look identical)
+        debug = result.get("optimization_debug")
+        if debug:
+            try:
+                print(f"\n{Fore.BLUE}🧩 Optimization Debug{Style.RESET_ALL}")
+                print(f"{Fore.WHITE}Instructions changed: {Fore.YELLOW}{debug.get('instructions_changed', 'N/A')}{Style.RESET_ALL}")
+                print(f"{Fore.WHITE}Demos changed: {Fore.YELLOW}{debug.get('demos_changed', 'N/A')}{Style.RESET_ALL}")
+                print(f"{Fore.WHITE}Demos (original → optimized): {Fore.YELLOW}{debug.get('original_demos_total', 'N/A')} → {debug.get('optimized_demos_total', 'N/A')}{Style.RESET_ALL}")
+            except (IOError, OSError):
+                print("\n🧩 Optimization Debug")
+                print(f"Instructions changed: {debug.get('instructions_changed', 'N/A')}")
+                print(f"Demos changed: {debug.get('demos_changed', 'N/A')}")
+                print(f"Demos (original → optimized): {debug.get('original_demos_total', 'N/A')} → {debug.get('optimized_demos_total', 'N/A')}")
+        
+        # Prompts
+        try:
+            print(f"\n{Fore.BLUE} Prompt Comparison{Style.RESET_ALL}")
+        except (IOError, OSError):
+            print("\n Prompt Comparison")
+        
+        # Original Prompt
+        if 'initial_prompt' in result:
+            try:
+                print(f"\n{Fore.WHITE}Original Prompt:{Style.RESET_ALL}")
+                print(f"{Fore.RED}{'─'*40}{Style.RESET_ALL}")
+                print(f"{result['initial_prompt']}")
+                print(f"{Fore.RED}{'─'*40}{Style.RESET_ALL}")
+            except (IOError, OSError):
+                print("\nOriginal Prompt:")
+                print("-"*40)
+                print(result['initial_prompt'])
+                print("-"*40)
+        
+        # Optimized Prompt
+        if 'result' in result:
+            try:
+                print(f"\n{Fore.WHITE}Optimized Prompt:{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}{'─'*40}{Style.RESET_ALL}")
+                print(f"{result['result']}")
+                print(f"{Fore.GREEN}{'─'*40}{Style.RESET_ALL}")
+            except (IOError, OSError):
+                print("\nOptimized Prompt:")
+                print("-"*40)
+                print(result['result'])
+                print("-"*40)
+        
+        # Synthetic Data Summary
+        synthetic_data = result.get('synthetic_data', [])
+        if synthetic_data:
+            try:
+                print(f"\n{Fore.BLUE}📚 Synthetic Data Generated{Style.RESET_ALL}")
+                print(f"{Fore.WHITE}Total Samples: {Fore.YELLOW}{len(synthetic_data)}{Style.RESET_ALL}")
+                
+                # Show a few examples
+                if len(synthetic_data) > 0:
+                    print(f"\n{Fore.WHITE}Sample Data:{Style.RESET_ALL}")
+                    for i, sample in enumerate(synthetic_data[:3]):  # Show first 3 samples
+                        print(f"{Fore.YELLOW}Sample {i+1}:{Style.RESET_ALL}")
+                        for key, value in sample.items():
+                            print(f"  {Fore.WHITE}{key}:{Style.RESET_ALL} {str(value)[:100]}{'...' if len(str(value)) > 100 else ''}")
+                    if len(synthetic_data) > 3:
+                        print(f"{Fore.YELLOW}... and {len(synthetic_data) - 3} more samples{Style.RESET_ALL}")
+            except (IOError, OSError):
+                print("\n📚 Synthetic Data Generated")
+                print(f"Total Samples: {len(synthetic_data)}")
+        
+        # Footer
+        try:
+            print(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}{'✨ Optimization Complete!':^80}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
+        except (IOError, OSError):
+            print("\n" + "="*80)
+            print("✨ Optimization Complete!".center(80))
+            print("="*80)
+        
+        # Reset colorama (wrap in try-except to prevent errors)
+        try:
+            if 'colorama' in sys.modules:
+                colorama.deinit()
+        except (IOError, OSError, AttributeError):
+            pass  # Silently ignore errors when deinitializing colorama
     
-    # Footer
-    print(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}{'✨ Optimization Complete!':^80}{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
-    
-    # Reset colorama
-    colorama.deinit()
+    except (IOError, OSError) as io_err:
+        # If there's an I/O error, try to print a simple version without colors
+        error_msg = str(io_err).lower()
+        if 'closed' in error_msg or 'i/o operation' in error_msg or 'lost sys.stderr' in error_msg:
+            try:
+                # Try to print basic results without fancy formatting
+                print("\n" + "="*80)
+                print(" OPTIMIZATION RESULTS".center(80))
+                print("="*80)
+                print(f"\nSession ID: {result.get('session_id', 'N/A')}")
+                print(f"Backend: {result.get('backend', 'N/A')}")
+                if 'metrics' in result:
+                    metrics = result['metrics']
+                    if 'initial_prompt_score' in metrics:
+                        print(f"Initial Score: {metrics['initial_prompt_score']:.4f}")
+                    if 'optimized_prompt_score' in metrics:
+                        print(f"Optimized Score: {metrics['optimized_prompt_score']:.4f}")
+                if 'result' in result:
+                    print(f"\nOptimized Prompt:\n{result['result']}")
+                print("\n" + "="*80)
+            except:
+                # If even basic printing fails, just return silently
+                pass
+    except Exception as e:
+        # Catch any other errors and try basic output
+        try:
+            print(f"\nOptimization completed. Result: {result.get('result', 'N/A')[:100]}...")
+        except:
+            pass
 
 def main():
     """Main entry point for the CLI application."""
     try:
+        # Load environment variables (including from .env file)
+        load_dotenv()
+        
         # Parse command line arguments
         args = parse_args()
 
